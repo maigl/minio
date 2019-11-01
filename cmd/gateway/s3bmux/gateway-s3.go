@@ -25,6 +25,7 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"os"
 	"net/url"
 	"strings"
 	"time"
@@ -265,8 +266,12 @@ func (g *S3) NewGatewayLayer(creds auth.Credentials) (minio.ObjectLayer, error) 
 	s := s3Objects{
 		Client: clnt,
 
-		masterBucket:  "masterbucket",
+		masterBucket:  os.Getenv("S3BMUX_MASTER_BUCKET"),
 	}
+	//TODO: add propper error handling
+	// ensure that master bucket exists
+	s.Client.MakeBucket(s.masterBucket, "")
+
 	// Enables single encryption of KMS is configured.
 	if minio.GlobalKMS != nil {
 		encS := s3EncObjects{s}
@@ -334,6 +339,7 @@ func (l *s3Objects) MakeBucketWithLocation(ctx context.Context, bucket, location
 
 	//bucket = "fake/" + bucket
 
+
 	fmt.Printf("in mb : '%v' \n", bucket )
 
 		_, err := l.Client.PutObject(l.masterBucket, bucket+"/",  bytes.NewBufferString(""), 0, "", "", nil, nil)
@@ -342,34 +348,48 @@ func (l *s3Objects) MakeBucketWithLocation(ctx context.Context, bucket, location
 
 // GetBucketInfo gets bucket metadata..
 func (l *s3Objects) GetBucketInfo(ctx context.Context, bucket string) (bi minio.BucketInfo, e error) {
-	buckets, err := l.Client.ListBuckets()
+	//buckets, err := l.Client.ListBuckets()
+	//if err != nil {
+	//	// Listbuckets may be disallowed, proceed to check if
+	//	// bucket indeed exists, if yes return success.
+	//	var ok bool
+	//	if ok, err = l.Client.BucketExists(bucket); err != nil {
+	//		return bi, minio.ErrorRespToObjectError(err, bucket)
+	//	}
+	//	if !ok {
+	//		return bi, minio.BucketNotFound{Bucket: bucket}
+	//	}
+	//	return minio.BucketInfo{
+	//		Name:    bi.Name,
+	//		Created: time.Now().UTC(),
+	//	}, nil
+	//}
+
+	//for _, bi := range buckets {
+	//	if bi.Name != bucket {
+	//		continue
+	//	}
+
+	//	return minio.BucketInfo{
+	//		Name:    bi.Name,
+	//		Created: bi.CreationDate,
+	//	}, nil
+	//}
+
+	//return bi, minio.BucketNotFound{Bucket: bucket}
+
+	fmt.Printf("get bucket info: %v\n", bucket)
+
+	buckets, err := l.ListBuckets(ctx)
 	if err != nil {
-		// Listbuckets may be disallowed, proceed to check if
-		// bucket indeed exists, if yes return success.
-		var ok bool
-		if ok, err = l.Client.BucketExists(bucket); err != nil {
-			return bi, minio.ErrorRespToObjectError(err, bucket)
-		}
-		if !ok {
-			return bi, minio.BucketNotFound{Bucket: bucket}
-		}
-		return minio.BucketInfo{
-			Name:    bi.Name,
-			Created: time.Now().UTC(),
-		}, nil
+		return bi, err
 	}
 
 	for _, bi := range buckets {
-		if bi.Name != bucket {
-			continue
+		if bi.Name == bucket {
+			return bi, nil
 		}
-
-		return minio.BucketInfo{
-			Name:    bi.Name,
-			Created: bi.CreationDate,
-		}, nil
 	}
-
 	return bi, minio.BucketNotFound{Bucket: bucket}
 }
 
@@ -406,7 +426,7 @@ func (l *s3Objects) ListBuckets(ctx context.Context) ([]minio.BucketInfo, error)
 		b := make([]minio.BucketInfo, len(list.CommonPrefixes))
 		for i, cp := range list.CommonPrefixes {
 			b[i] = minio.BucketInfo{
-				Name: cp.Prefix,
+				Name: strings.TrimSuffix(cp.Prefix,"/"),
 				///Created: bi.CreationDate,
 			}
 		}
