@@ -17,7 +17,6 @@
 package s3bmux
 
 import (
-	"path"
 	"bytes"
 	"fmt"
 	"context"
@@ -270,10 +269,16 @@ func (g *S3) NewGatewayLayer(creds auth.Credentials) (minio.ObjectLayer, error) 
 		return nil, err
 	}
 
+	masterBucket :=  os.Getenv("S3BMUX_MASTER_BUCKET")
+	if masterBucket == "" {
+		log.Info().Msg("found empty master bucket name -> fallbacket to 'master'")
+		masterBucket = "master"
+	}
+
 	s := s3Objects{
 		Client: clnt,
 
-		masterBucket:  os.Getenv("S3BMUX_MASTER_BUCKET"),
+		masterBucket:  masterBucket,
 	}
 	//TODO: add propper error handling
 	// ensure that master bucket exists
@@ -306,7 +311,18 @@ type s3Objects struct {
 }
 
 func (l *s3Objects) transform(bucket, object string) (string, string) {
-	return l.masterBucket, path.Join(bucket, object)
+	//cannot use path.join .. this would remove any trailing '/' which is imporant
+	//e.g. to create directories
+	return l.masterBucket, bucket +"/"+object
+}
+
+// sometimes the prefix has a trailing '/' and sometimes it doesn't
+// this helps to ensure we always have a '/' at the end.
+func fixPrefix(prefix string) string {
+	if strings.HasSuffix(prefix, "/") {
+		return prefix
+	}
+	return prefix + "/"
 }
 
 // Shutdown saves any gateway metadata to disk
@@ -456,7 +472,8 @@ func (l *s3Objects) ListBuckets(ctx context.Context) ([]minio.BucketInfo, error)
 // DeleteBucket deletes a bucket on S3
 func (l *s3Objects) DeleteBucket(ctx context.Context, bucket string) error {
 	defer G(O("$FN(bucket: %s)", bucket))
-	err := l.Client.RemoveBucket(bucket)
+
+	err := l.DeleteObject(ctx, bucket, "")
 	if err != nil {
 		return minio.ErrorRespToObjectError(err, bucket)
 	}
@@ -467,6 +484,7 @@ func (l *s3Objects) DeleteBucket(ctx context.Context, bucket string) error {
 func (l *s3Objects) ListObjects(ctx context.Context, bucket string, prefix string, marker string, delimiter string, maxKeys int) (loi minio.ListObjectsInfo, e error) {
 	defer G(O("$FN(bucket: %s,  prefix: %s)", bucket, prefix))
 
+	bucketOrig := bucket
 	bucket, prefix = l.transform(bucket,  prefix)
 
 	result, err := l.Client.ListObjects(bucket, prefix, marker, delimiter, maxKeys)
@@ -474,14 +492,27 @@ func (l *s3Objects) ListObjects(ctx context.Context, bucket string, prefix strin
 		return loi, minio.ErrorRespToObjectError(err, bucket)
 	}
 
-	log.Info().Msgf("List Objects result: %+v", result)
-	return minio.FromMinioClientListBucketResult(bucket, result), nil
+	r := minio.FromMinioClientListBucketResult(bucket, result)
+
+	//back-transform result
+	for i,obj := range r.Objects {
+		r.Objects[i].Bucket = bucketOrig
+		r.Objects[i].Name = strings.TrimPrefix(obj.Name, bucketOrig+"/")
+	}
+	for i, p := range r.Prefixes {
+		r.Prefixes[i] = strings.TrimPrefix(p, prefix )
+	}
+
+	//return minio.FromMinioClientListBucketResult(bucket, result), nil
+	log.Info().Msgf("List Objects result (%v, %v): %+v", bucket, prefix,  r)
+	return r, nil
 }
 
 // ListObjectsV2 lists all blobs in S3 bucket filtered by prefix
 func (l *s3Objects) ListObjectsV2(ctx context.Context, bucket, prefix, continuationToken, delimiter string, maxKeys int, fetchOwner bool, startAfter string) (loi minio.ListObjectsV2Info, e error) {
 	defer G(O("$FN(bucket: %s,  prefix: %s)", bucket, prefix))
 
+	bucketOrig := bucket
 	bucket, prefix = l.transform(bucket,  prefix)
 
 	result, err := l.Client.ListObjectsV2(bucket, prefix, continuationToken, fetchOwner, delimiter, maxKeys, startAfter)
@@ -489,7 +520,20 @@ func (l *s3Objects) ListObjectsV2(ctx context.Context, bucket, prefix, continuat
 		return loi, minio.ErrorRespToObjectError(err, bucket)
 	}
 
-	return minio.FromMinioClientListBucketV2Result(bucket, result), nil
+	log.Info().Msgf("List Objects V2 result: %+v", result)
+
+	r:= minio.FromMinioClientListBucketV2Result(bucket, result)
+
+	//re-transform result
+	for i,obj := range r.Objects {
+		r.Objects[i].Bucket = bucketOrig
+		r.Objects[i].Name = strings.TrimPrefix(obj.Name, bucketOrig + "/")
+	}
+	for i, p := range r.Prefixes {
+		r.Prefixes[i] = strings.TrimPrefix(p, prefix )
+	}
+
+	return r, nil
 }
 
 // GetObjectNInfo - returns object info and locked object ReadCloser
@@ -516,7 +560,11 @@ func (l *s3Objects) GetObjectNInfo(ctx context.Context, bucket, object string, r
 	// Setup cleanup function to cause the above go-routine to
 	// exit in case of partial read
 	pipeCloser := func() { pr.Close() }
-	return minio.NewGetObjectReaderFromReader(pr, objInfo, opts.CheckCopyPrecondFn, pipeCloser)
+	reader, err := minio.NewGetObjectReaderFromReader(pr, objInfo, opts.CheckCopyPrecondFn, pipeCloser)
+
+    //TODO do we have to update (backtransform bucket + object) in the objctinfo of this result ??
+	return reader, err
+
 }
 
 // GetObject reads an object from S3. Supports additional
@@ -539,6 +587,9 @@ func (l *s3Objects) GetObject(ctx context.Context, bucket string, key string, st
 			return minio.ErrorRespToObjectError(err, bucket, key)
 		}
 	}
+
+	bucket, key = l.transform(bucket, key)
+
 	object, _, _, err := l.Client.GetObject(bucket, key, opts)
 	if err != nil {
 		return minio.ErrorRespToObjectError(err, bucket, key)
@@ -626,6 +677,10 @@ func (l *s3Objects) CopyObject(ctx context.Context, srcBucket string, srcObject 
 // DeleteObject deletes a blob in bucket
 func (l *s3Objects) DeleteObject(ctx context.Context, bucket string, object string) error {
 	defer G(O("$FN(bucket: %s,  object: %s)", bucket, object))
+
+	return nil
+	bucket, object = l.transform(bucket, object)
+
 	err := l.Client.RemoveObject(bucket, object)
 	if err != nil {
 		return minio.ErrorRespToObjectError(err, bucket, object)
@@ -646,6 +701,9 @@ func (l *s3Objects) DeleteObjects(ctx context.Context, bucket string, objects []
 // ListMultipartUploads lists all multipart uploads.
 func (l *s3Objects) ListMultipartUploads(ctx context.Context, bucket string, prefix string, keyMarker string, uploadIDMarker string, delimiter string, maxUploads int) (lmi minio.ListMultipartsInfo, e error) {
 	defer G(O("$FN(bucket: %s,  prefix: %s)", bucket,prefix))
+
+	bucket, prefix = l.transform(bucket, prefix)
+
 	result, err := l.Client.ListMultipartUploads(bucket, prefix, keyMarker, uploadIDMarker, delimiter, maxUploads)
 	if err != nil {
 		return lmi, err
@@ -657,6 +715,7 @@ func (l *s3Objects) ListMultipartUploads(ctx context.Context, bucket string, pre
 // NewMultipartUpload upload object in multiple parts
 func (l *s3Objects) NewMultipartUpload(ctx context.Context, bucket string, object string, o minio.ObjectOptions) (uploadID string, err error) {
 	defer G(O("$FN(bucket: %s,  object: %v)", bucket, object))
+	bucket, object = l.transform(bucket, object)
 	// Create PutObject options
 	opts := miniogo.PutObjectOptions{UserMetadata: o.UserDefined, ServerSideEncryption: o.ServerSideEncryption}
 	uploadID, err = l.Client.NewMultipartUpload(bucket, object, opts)
@@ -669,6 +728,9 @@ func (l *s3Objects) NewMultipartUpload(ctx context.Context, bucket string, objec
 // PutObjectPart puts a part of object in bucket
 func (l *s3Objects) PutObjectPart(ctx context.Context, bucket string, object string, uploadID string, partID int, r *minio.PutObjReader, opts minio.ObjectOptions) (pi minio.PartInfo, e error) {
 	defer G(O("$FN(bucket: %s,  object: %v)", bucket, object))
+
+	bucket, object = l.transform(bucket, object)
+
 	data := r.Reader
 	info, err := l.Client.PutObjectPart(bucket, object, uploadID, partID, data, data.Size(), data.MD5Base64String(), data.SHA256HexString(), opts.ServerSideEncryption)
 	if err != nil {
@@ -714,17 +776,23 @@ func (l *s3Objects) CopyObjectPart(ctx context.Context, srcBucket, srcObject, de
 // ListObjectParts returns all object parts for specified object in specified bucket
 func (l *s3Objects) ListObjectParts(ctx context.Context, bucket string, object string, uploadID string, partNumberMarker int, maxParts int, opts minio.ObjectOptions) (lpi minio.ListPartsInfo, e error) {
 	defer G(O("$FN(bucket: %s,  object: %v)", bucket, object))
+
+	bucket, object = l.transform(bucket, object)
+
 	result, err := l.Client.ListObjectParts(bucket, object, uploadID, partNumberMarker, maxParts)
 	if err != nil {
 		return lpi, minio.ErrorRespToObjectError(err, bucket, object)
 	}
 
-	return minio.FromMinioClientListPartsInfo(result), nil
+	info := minio.FromMinioClientListPartsInfo(result)
+
+	return info, nil
 }
 
 // AbortMultipartUpload aborts a ongoing multipart upload
 func (l *s3Objects) AbortMultipartUpload(ctx context.Context, bucket string, object string, uploadID string) error {
 	defer G(O("$FN(bucket: %s,  object: %v)", bucket, object))
+	bucket, object = l.transform(bucket, object)
 	err := l.Client.AbortMultipartUpload(bucket, object, uploadID)
 	return minio.ErrorRespToObjectError(err, bucket, object)
 }
@@ -732,6 +800,7 @@ func (l *s3Objects) AbortMultipartUpload(ctx context.Context, bucket string, obj
 // CompleteMultipartUpload completes ongoing multipart upload and finalizes object
 func (l *s3Objects) CompleteMultipartUpload(ctx context.Context, bucket string, object string, uploadID string, uploadedParts []minio.CompletePart, opts minio.ObjectOptions) (oi minio.ObjectInfo, e error) {
 	defer G(O("$FN(bucket: %s,  object: %v)", bucket, object))
+	bucket, object = l.transform(bucket, object)
 	etag, err := l.Client.CompleteMultipartUpload(bucket, object, uploadID, minio.ToMinioClientCompleteParts(uploadedParts))
 	if err != nil {
 		return oi, minio.ErrorRespToObjectError(err, bucket, object)
