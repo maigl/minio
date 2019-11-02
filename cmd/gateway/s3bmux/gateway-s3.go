@@ -30,6 +30,9 @@ import (
 	"strings"
 	"time"
 
+    "github.com/rs/zerolog/log"
+
+
 	"github.com/minio/cli"
 	miniogo "github.com/minio/minio-go/v6"
 	"github.com/minio/minio-go/v6/pkg/credentials"
@@ -40,6 +43,8 @@ import (
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/auth"
 	"github.com/minio/minio/pkg/policy"
+    "github.com/sabhiram/go-tracey"
+
 )
 
 const (
@@ -123,6 +128,8 @@ EXAMPLES:
 		HideHelpCommand:    true,
 	})
 }
+
+var G, O = tracey.New(nil)
 
 // Handler for 'minio gateway s3' command line.
 func s3GatewayMain(ctx *cli.Context) {
@@ -315,6 +322,9 @@ func (l *s3Objects) StorageInfo(ctx context.Context) (si minio.StorageInfo) {
 
 // MakeBucket creates a new container on S3 backend.
 func (l *s3Objects) MakeBucketWithLocation(ctx context.Context, bucket, location string) error {
+
+	defer G(O("$FN(bucket: %s)", bucket))
+
 	// Verify if bucket name is valid.
 	// We are using a separate helper function here to validate bucket
 	// names instead of IsValidBucketName() because there is a possibility
@@ -348,6 +358,7 @@ func (l *s3Objects) MakeBucketWithLocation(ctx context.Context, bucket, location
 
 // GetBucketInfo gets bucket metadata..
 func (l *s3Objects) GetBucketInfo(ctx context.Context, bucket string) (bi minio.BucketInfo, e error) {
+	defer G(O("$FN(bucket: %s)", bucket))
 	//buckets, err := l.Client.ListBuckets()
 	//if err != nil {
 	//	// Listbuckets may be disallowed, proceed to check if
@@ -382,19 +393,25 @@ func (l *s3Objects) GetBucketInfo(ctx context.Context, bucket string) (bi minio.
 
 	buckets, err := l.ListBuckets(ctx)
 	if err != nil {
+		log.Error().Err(err).Msg("cannot list buckets")
 		return bi, err
 	}
 
 	for _, bi := range buckets {
 		if bi.Name == bucket {
+			log.Info().Msgf("found bucket: %+v", bi)
 			return bi, nil
 		}
 	}
+
+	fmt.Printf("get bucket info: %v, res %+v\n", bucket, bi)
+
 	return bi, minio.BucketNotFound{Bucket: bucket}
 }
 
 // ListBuckets lists all S3 buckets
 func (l *s3Objects) ListBuckets(ctx context.Context) ([]minio.BucketInfo, error) {
+	defer G(O("$FN"))
 	//buckets, err := l.Client.ListBuckets()
 	//if err != nil {
 	//	return nil, minio.ErrorRespToObjectError(err)
@@ -438,6 +455,7 @@ func (l *s3Objects) ListBuckets(ctx context.Context) ([]minio.BucketInfo, error)
 
 // DeleteBucket deletes a bucket on S3
 func (l *s3Objects) DeleteBucket(ctx context.Context, bucket string) error {
+	defer G(O("$FN(bucket: %s)", bucket))
 	err := l.Client.RemoveBucket(bucket)
 	if err != nil {
 		return minio.ErrorRespToObjectError(err, bucket)
@@ -447,16 +465,24 @@ func (l *s3Objects) DeleteBucket(ctx context.Context, bucket string) error {
 
 // ListObjects lists all blobs in S3 bucket filtered by prefix
 func (l *s3Objects) ListObjects(ctx context.Context, bucket string, prefix string, marker string, delimiter string, maxKeys int) (loi minio.ListObjectsInfo, e error) {
+	defer G(O("$FN(bucket: %s,  prefix: %s)", bucket, prefix))
+
+	bucket, prefix = l.transform(bucket,  prefix)
+
 	result, err := l.Client.ListObjects(bucket, prefix, marker, delimiter, maxKeys)
 	if err != nil {
 		return loi, minio.ErrorRespToObjectError(err, bucket)
 	}
 
+	log.Info().Msgf("List Objects result: %+v", result)
 	return minio.FromMinioClientListBucketResult(bucket, result), nil
 }
 
 // ListObjectsV2 lists all blobs in S3 bucket filtered by prefix
 func (l *s3Objects) ListObjectsV2(ctx context.Context, bucket, prefix, continuationToken, delimiter string, maxKeys int, fetchOwner bool, startAfter string) (loi minio.ListObjectsV2Info, e error) {
+	defer G(O("$FN(bucket: %s,  prefix: %s)", bucket, prefix))
+
+	bucket, prefix = l.transform(bucket,  prefix)
 
 	result, err := l.Client.ListObjectsV2(bucket, prefix, continuationToken, fetchOwner, delimiter, maxKeys, startAfter)
 	if err != nil {
@@ -468,6 +494,8 @@ func (l *s3Objects) ListObjectsV2(ctx context.Context, bucket, prefix, continuat
 
 // GetObjectNInfo - returns object info and locked object ReadCloser
 func (l *s3Objects) GetObjectNInfo(ctx context.Context, bucket, object string, rs *minio.HTTPRangeSpec, h http.Header, lockType minio.LockType, opts minio.ObjectOptions) (gr *minio.GetObjectReader, err error) {
+	defer G(O("$FN(bucket: %s,  object: %s)", bucket, object))
+
 	var objInfo minio.ObjectInfo
 	objInfo, err = l.GetObjectInfo(ctx, bucket, object, opts)
 	if err != nil {
@@ -498,6 +526,7 @@ func (l *s3Objects) GetObjectNInfo(ctx context.Context, bucket, object string, r
 // startOffset indicates the starting read location of the object.
 // length indicates the total length of the object.
 func (l *s3Objects) GetObject(ctx context.Context, bucket string, key string, startOffset int64, length int64, writer io.Writer, etag string, o minio.ObjectOptions) error {
+	defer G(O("$FN(bucket: %s,  key: %s)", bucket, key))
 	if length < 0 && length != -1 {
 		return minio.ErrorRespToObjectError(minio.InvalidRange{}, bucket, key)
 	}
@@ -523,6 +552,10 @@ func (l *s3Objects) GetObject(ctx context.Context, bucket string, key string, st
 
 // GetObjectInfo reads object info and replies back ObjectInfo
 func (l *s3Objects) GetObjectInfo(ctx context.Context, bucket string, object string, opts minio.ObjectOptions) (objInfo minio.ObjectInfo, err error) {
+	defer G(O("$FN(bucket: %s,  object: %s)", bucket, object))
+
+	bucket, object = l.transform(bucket, object)
+
 	oi, err := l.Client.StatObject(bucket, object, miniogo.StatObjectOptions{
 		GetObjectOptions: miniogo.GetObjectOptions{
 			ServerSideEncryption: opts.ServerSideEncryption,
@@ -537,9 +570,9 @@ func (l *s3Objects) GetObjectInfo(ctx context.Context, bucket string, object str
 
 // PutObject creates a new object with the incoming data,
 func (l *s3Objects) PutObject(ctx context.Context, bucket string, object string, r *minio.PutObjReader, opts minio.ObjectOptions) (objInfo minio.ObjectInfo, err error) {
+	defer G(O("$FN(bucket: %s,  object: %s)", bucket, object))
 
-	object = bucket + "/" + object
-	bucket = "fake"
+	bucket, object = l.transform(bucket, object)
 
 	data := r.Reader
 
@@ -557,6 +590,12 @@ func (l *s3Objects) PutObject(ctx context.Context, bucket string, object string,
 
 // CopyObject copies an object from source bucket to a destination bucket.
 func (l *s3Objects) CopyObject(ctx context.Context, srcBucket string, srcObject string, dstBucket string, dstObject string, srcInfo minio.ObjectInfo, srcOpts, dstOpts minio.ObjectOptions) (objInfo minio.ObjectInfo, err error) {
+	defer G(O("$FN(srcBucket: %s, dstBucket: %s,  srcobject: %s,  dstObject:%s)", srcBucket, dstBucket, srcObject, dstObject))
+
+	dstBucketOrig, dstObjectOrig := dstBucket, dstObject
+	srcBucket, srcObject = l.transform(srcBucket, srcObject)
+	dstBucket, dstObject=l.transform(dstBucket, dstObject)
+
 	if srcOpts.CheckCopyPrecondFn != nil && srcOpts.CheckCopyPrecondFn(srcInfo, "") {
 		return minio.ObjectInfo{}, minio.PreConditionFailed{}
 	}
@@ -581,11 +620,12 @@ func (l *s3Objects) CopyObject(ctx context.Context, srcBucket string, srcObject 
 	if _, err = l.Client.CopyObject(srcBucket, srcObject, dstBucket, dstObject, srcInfo.UserDefined); err != nil {
 		return objInfo, minio.ErrorRespToObjectError(err, srcBucket, srcObject)
 	}
-	return l.GetObjectInfo(ctx, dstBucket, dstObject, dstOpts)
+	return l.GetObjectInfo(ctx, dstBucketOrig, dstObjectOrig, dstOpts)
 }
 
 // DeleteObject deletes a blob in bucket
 func (l *s3Objects) DeleteObject(ctx context.Context, bucket string, object string) error {
+	defer G(O("$FN(bucket: %s,  object: %s)", bucket, object))
 	err := l.Client.RemoveObject(bucket, object)
 	if err != nil {
 		return minio.ErrorRespToObjectError(err, bucket, object)
@@ -595,6 +635,7 @@ func (l *s3Objects) DeleteObject(ctx context.Context, bucket string, object stri
 }
 
 func (l *s3Objects) DeleteObjects(ctx context.Context, bucket string, objects []string) ([]error, error) {
+	defer G(O("$FN(bucket: %s,  object: %v)", bucket, objects))
 	errs := make([]error, len(objects))
 	for idx, object := range objects {
 		errs[idx] = l.DeleteObject(ctx, bucket, object)
@@ -604,6 +645,7 @@ func (l *s3Objects) DeleteObjects(ctx context.Context, bucket string, objects []
 
 // ListMultipartUploads lists all multipart uploads.
 func (l *s3Objects) ListMultipartUploads(ctx context.Context, bucket string, prefix string, keyMarker string, uploadIDMarker string, delimiter string, maxUploads int) (lmi minio.ListMultipartsInfo, e error) {
+	defer G(O("$FN(bucket: %s,  prefix: %s)", bucket,prefix))
 	result, err := l.Client.ListMultipartUploads(bucket, prefix, keyMarker, uploadIDMarker, delimiter, maxUploads)
 	if err != nil {
 		return lmi, err
@@ -614,6 +656,7 @@ func (l *s3Objects) ListMultipartUploads(ctx context.Context, bucket string, pre
 
 // NewMultipartUpload upload object in multiple parts
 func (l *s3Objects) NewMultipartUpload(ctx context.Context, bucket string, object string, o minio.ObjectOptions) (uploadID string, err error) {
+	defer G(O("$FN(bucket: %s,  object: %v)", bucket, object))
 	// Create PutObject options
 	opts := miniogo.PutObjectOptions{UserMetadata: o.UserDefined, ServerSideEncryption: o.ServerSideEncryption}
 	uploadID, err = l.Client.NewMultipartUpload(bucket, object, opts)
@@ -625,6 +668,7 @@ func (l *s3Objects) NewMultipartUpload(ctx context.Context, bucket string, objec
 
 // PutObjectPart puts a part of object in bucket
 func (l *s3Objects) PutObjectPart(ctx context.Context, bucket string, object string, uploadID string, partID int, r *minio.PutObjReader, opts minio.ObjectOptions) (pi minio.PartInfo, e error) {
+	defer G(O("$FN(bucket: %s,  object: %v)", bucket, object))
 	data := r.Reader
 	info, err := l.Client.PutObjectPart(bucket, object, uploadID, partID, data, data.Size(), data.MD5Base64String(), data.SHA256HexString(), opts.ServerSideEncryption)
 	if err != nil {
@@ -638,6 +682,7 @@ func (l *s3Objects) PutObjectPart(ctx context.Context, bucket string, object str
 // existing object or a part of it.
 func (l *s3Objects) CopyObjectPart(ctx context.Context, srcBucket, srcObject, destBucket, destObject, uploadID string,
 	partID int, startOffset, length int64, srcInfo minio.ObjectInfo, srcOpts, dstOpts minio.ObjectOptions) (p minio.PartInfo, err error) {
+	defer G(O("$FN(srcBucket: %s, dstBucket: %s,  srcobject: %s,  dstObject:%s)", srcBucket, destBucket, srcObject, destObject))
 	if srcOpts.CheckCopyPrecondFn != nil && srcOpts.CheckCopyPrecondFn(srcInfo, "") {
 		return minio.PartInfo{}, minio.PreConditionFailed{}
 	}
@@ -668,6 +713,7 @@ func (l *s3Objects) CopyObjectPart(ctx context.Context, srcBucket, srcObject, de
 
 // ListObjectParts returns all object parts for specified object in specified bucket
 func (l *s3Objects) ListObjectParts(ctx context.Context, bucket string, object string, uploadID string, partNumberMarker int, maxParts int, opts minio.ObjectOptions) (lpi minio.ListPartsInfo, e error) {
+	defer G(O("$FN(bucket: %s,  object: %v)", bucket, object))
 	result, err := l.Client.ListObjectParts(bucket, object, uploadID, partNumberMarker, maxParts)
 	if err != nil {
 		return lpi, minio.ErrorRespToObjectError(err, bucket, object)
@@ -678,12 +724,14 @@ func (l *s3Objects) ListObjectParts(ctx context.Context, bucket string, object s
 
 // AbortMultipartUpload aborts a ongoing multipart upload
 func (l *s3Objects) AbortMultipartUpload(ctx context.Context, bucket string, object string, uploadID string) error {
+	defer G(O("$FN(bucket: %s,  object: %v)", bucket, object))
 	err := l.Client.AbortMultipartUpload(bucket, object, uploadID)
 	return minio.ErrorRespToObjectError(err, bucket, object)
 }
 
 // CompleteMultipartUpload completes ongoing multipart upload and finalizes object
 func (l *s3Objects) CompleteMultipartUpload(ctx context.Context, bucket string, object string, uploadID string, uploadedParts []minio.CompletePart, opts minio.ObjectOptions) (oi minio.ObjectInfo, e error) {
+	defer G(O("$FN(bucket: %s,  object: %v)", bucket, object))
 	etag, err := l.Client.CompleteMultipartUpload(bucket, object, uploadID, minio.ToMinioClientCompleteParts(uploadedParts))
 	if err != nil {
 		return oi, minio.ErrorRespToObjectError(err, bucket, object)
@@ -694,6 +742,7 @@ func (l *s3Objects) CompleteMultipartUpload(ctx context.Context, bucket string, 
 
 // SetBucketPolicy sets policy on bucket
 func (l *s3Objects) SetBucketPolicy(ctx context.Context, bucket string, bucketPolicy *policy.Policy) error {
+	defer G(O("$FN(bucket: %s)", bucket))
 	data, err := json.Marshal(bucketPolicy)
 	if err != nil {
 		// This should not happen.
